@@ -1,0 +1,137 @@
+name: Graceful shutdown proof
+
+on:
+  push:
+    branches: ["codex/secure12619-proof-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signals:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "20", "24"]
+    env:
+      CI: "true"
+      APP_SHA: 50183446e4e5ee0f7dd74049fc0da3c5644541d8
+      BASE_SHA: 55192fc22fabccbad581718d01cec6d221808967
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Verify all application files against the frozen candidate
+        run: |
+          echo "PROOF=$RUNNER_TEMP/shutdown-proof" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/shutdown-proof"
+          test "$(git rev-parse HEAD^)" = "$APP_SHA"
+          git diff --exit-code "$APP_SHA" HEAD -- . ':!.github/workflows/graceful-shutdown-proof.yml'
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          import {createHash} from 'node:crypto';
+          import {readFileSync,writeFileSync} from 'node:fs';
+          const git = args => execFileSync('git',args);
+          const tree=git(['rev-parse',`${process.env.APP_SHA}^{tree}`]).toString().trim();
+          assert.equal(tree,'57a5d233d5038cf63bb4eb06ec3ef0e8c589b834');
+          const entries=git(['ls-tree','-r','-z',process.env.APP_SHA]).toString().split('\0').filter(Boolean).map(line=>{
+            const [meta,path]=line.split('\t'),[mode,type,blob]=meta.split(' ');
+            assert.equal(type,'blob');
+            const bytes=readFileSync(path);
+            assert.equal(git(['hash-object','--',path]).toString().trim(),blob,path);
+            return {path,mode,git_blob:blob,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};
+          });
+          assert.equal(entries.length,83);
+          assert.equal(entries.reduce((n,x)=>n+x.bytes,0),166852);
+          writeFileSync(`${process.env.RUNNER_TEMP}/shutdown-proof/source.json`,JSON.stringify({candidate:process.env.APP_SHA,tree,entries},null,2));
+          console.log(`Verified ${entries.length} exact application files on ${process.version}/${process.platform}`);
+          NODE
+      - name: Install locked API dependencies without install scripts
+        run: npm ci --workspace apps/api --include-workspace-root --ignore-scripts --no-audit --no-fund
+      - name: Original stock command and health test
+        run: |
+          BASE_DIR="$RUNNER_TEMP/shutdown-original"
+          echo "BASE_DIR=$BASE_DIR" >> "$GITHUB_ENV"
+          git worktree add --detach "$BASE_DIR" "$BASE_SHA"
+          cd "$BASE_DIR"
+          npm ci --workspace apps/api --include-workspace-root --ignore-scripts --no-audit --no-fund
+          set +e
+          npm test > "$PROOF/original-stock.log" 2>&1
+          STOCK_RESULT=$?
+          set -e
+          printf '%s\n' "$STOCK_RESULT" > "$PROOF/original-stock.exit"
+          if test "$STOCK_RESULT" != 0; then
+            grep -q 'MODULE_NOT_FOUND' "$PROOF/original-stock.log"
+            grep -q 'src/tests' "$PROOF/original-stock.log"
+          fi
+          node --test --test-reporter=tap apps/api/src/tests/health.test.js > "$PROOF/original-health.log" 2>&1
+      - name: Original production API fails both signal regressions
+        run: |
+          cp apps/api/src/tests/gracefulShutdown.test.js "$BASE_DIR/apps/api/src/tests/gracefulShutdown.test.js"
+          cd "$BASE_DIR"
+          set +e
+          node --test --test-reporter=tap --test-name-pattern='production API exits cleanly' apps/api/src/tests/gracefulShutdown.test.js > "$PROOF/original-signal-negative.log" 2>&1
+          NEGATIVE_RESULT=$?
+          set -e
+          test "$NEGATIVE_RESULT" = 1
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {readFileSync} from 'node:fs';
+          const log=readFileSync(`${process.env.PROOF}/original-signal-negative.log`,'utf8');
+          assert.match(log,/# fail 2\b/);
+          assert.match(log,/signal: ['"]SIGTERM['"]/);
+          assert.match(log,/signal: ['"]SIGINT['"]/);
+          assert.doesNotMatch(log,/ERR_MODULE_NOT_FOUND|Child did not become ready|Child exited before readiness/);
+          console.log('Both original healthy API processes terminate by signal instead of exiting cleanly.');
+          NODE
+          git diff --exit-code
+      - name: Candidate stock command retains the original outcome
+        run: |
+          set +e
+          npm test > "$PROOF/candidate-stock.log" 2>&1
+          STOCK_RESULT=$?
+          set -e
+          printf '%s\n' "$STOCK_RESULT" > "$PROOF/candidate-stock.exit"
+          test "$STOCK_RESULT" = "$(cat "$PROOF/original-stock.exit")"
+          if test "$STOCK_RESULT" != 0; then
+            grep -q 'MODULE_NOT_FOUND' "$PROOF/candidate-stock.log"
+            grep -q 'src/tests' "$PROOF/candidate-stock.log"
+          fi
+      - name: All API tests with real operating-system signals
+        run: |
+          node --check apps/api/src/server.js
+          node --check apps/api/src/utils/gracefulShutdown.js
+          node --check apps/api/src/tests/gracefulShutdown.test.js
+          node --test --test-reporter=tap apps/api/src/tests/health.test.js apps/api/src/tests/gracefulShutdown.test.js > "$PROOF/candidate-api.log" 2>&1
+          cat "$PROOF/candidate-api.log"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {readFileSync} from 'node:fs';
+          const log=readFileSync(`${process.env.PROOF}/candidate-api.log`,'utf8');
+          assert.match(log,/# tests 8\b/); assert.match(log,/# pass 8\b/);
+          assert.match(log,/# fail 0\b/); assert.match(log,/# skipped 0\b/);
+          NODE
+      - name: Final clean exact-source guard
+        if: always()
+        run: |
+          test "$(git rev-parse HEAD^)" = "$APP_SHA"
+          git diff --exit-code "$APP_SHA" -- . ':!.github/workflows/graceful-shutdown-proof.yml'
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve source and complete test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shutdown-node${{ matrix.node }}-${{ env.APP_SHA }}
+          path: ${{ runner.temp }}/shutdown-proof
+          if-no-files-found: error
+          retention-days: 7
